@@ -1,0 +1,8 @@
+person
+wheelchair
+shoppingcart
+babybuggy
+R
+L
+F
+B

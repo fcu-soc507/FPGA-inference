@@ -1,0 +1,543 @@
+/*
+ * Copyright 2019 Xilinx Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <glog/logging.h>
+
+#include <iostream>
+#include <memory>
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+#include <vitis/ai/yolov3.hpp>
+#include <vitis/ai/demo.hpp>
+
+#include "./process_result.hpp"
+#include "vart/runner_ext.hpp"
+#include "vitis/ai/graph_runner.hpp"
+#include "sort/include/tracker.h"
+
+// int main(int argc, char *argv[]) {
+//   std::string model = argv[1];
+//   std::cout << "argc = " << argc << std::endl;
+//   std::cout << "argv = " << *argv << std::endl;    // 為什麼只顯示第一個?
+//   return vitis::ai::main_for_video_demo(           // 有沒有return 似乎沒有關西
+//       argc, argv,
+//       [model] {
+//         return vitis::ai::YOLOv3::create(model);
+//       },process_result, 2);
+// }
+
+using namespace vitis::ai;
+
+struct TrackInfo {
+    TrackInfo() = default;
+    TrackInfo(const FrameInfo& info)
+    : frame_id(info.frame_id)
+    , mat(info.mat) {}
+
+    operator FrameInfo() const {
+        return FrameInfo{0, frame_id, mat};
+    }
+
+    unsigned long frame_id;
+    cv::Mat mat;
+    std::vector<cv::Rect2f> velocity;
+    std::vector<YOLOv3Result::BoundingBox> bboxes;
+};
+
+static cv::Mat process_result(cv::Mat &image,
+                              const TrackInfo &result,
+                              float ratio = 1.0) {
+  for (int i = 0; i < result.bboxes.size(); i++) {
+    // std::cout << sizeof(result) << std::endl;
+    auto bbox = result.bboxes[i];
+    int label = bbox.label;
+    float xmin = bbox.x * image.cols + 1;
+    float ymin = bbox.y * image.rows + 1;
+    float xmax = xmin + bbox.width * image.cols;
+    float ymax = ymin + bbox.height * image.rows;
+    if(ratio > 0) {
+        auto velocity = result.velocity[i];
+        xmin += velocity.x * ratio;
+        ymin += velocity.y * ratio;
+        xmax += velocity.x * ratio;
+        ymax += velocity.y * ratio;
+    }
+    float confidence = bbox.score;
+    if (xmax > image.cols) xmax = image.cols;
+    if (ymax > image.rows) ymax = image.rows;
+    cv::rectangle(image, cv::Point(xmin, ymin), cv::Point(xmax, ymax),
+                  getColor(label), 1, 1, 0);
+    cv::putText id[i]
+  }
+  return image;
+}
+
+
+using trackq_t = vitis::ai::BoundedQueue<TrackInfo>;
+
+class MuxThread : public MyThread {
+public:
+    MuxThread(queue_t* in, trackq_t* iout, trackq_t* pout, int gop)
+        : MyThread{}
+        , in_(in)
+        , iout_(iout)
+        , pout_(pout)
+        , gop_(gop)
+    {}
+
+    ~MuxThread() {}
+
+    virtual int run() override {
+        FrameInfo frame;
+        // std::cout<< frame.frame_id << std::endl;
+        if (!in_->pop(frame, std::chrono::milliseconds(500))) {
+            return 0;
+        }
+        
+        std::cout << "muxer: " << frame.frame_id << "," << frame.mat.size() << std::endl;
+
+        if(gop_ == 1 || frame.frame_id % gop_ == 1) {
+            while(!iout_->push(TrackInfo{frame}, std::chrono::milliseconds(500))) {
+                if(is_stopped()) { return -1; }
+            } 
+            return 0;
+        } else {
+            while(!pout_->push(TrackInfo{frame}, std::chrono::milliseconds(500))) {
+                if(is_stopped()) { return -1; }
+            }
+            return 0;
+        } 
+    }
+
+    virtual std::string name() override {
+        return std::string{"MuxThread"};
+    }
+
+private:
+    queue_t* in_;
+    trackq_t* iout_;
+    trackq_t* pout_;
+    int gop_;
+};
+
+class PFrameThread : public MyThread {
+public:
+    PFrameThread(trackq_t* in, queue_t* out, trackq_t* track, int gop)
+        : MyThread{}
+        , in_(in)
+        , out_(out)
+        , track_(track)
+        , gop_(gop)
+    {}
+
+    ~PFrameThread() {}
+
+    virtual int run() override {
+        TrackInfo frame;
+        TrackInfo ifinfo;
+        if (!track_->top(ifinfo, std::chrono::milliseconds(500))) {
+            return 0;
+        }
+        std::cout<< "in p frame " << std::endl;
+
+        if(gop_ == 1) {
+            track_->pop(ifinfo, std::chrono::milliseconds(500));
+            return 0;
+        }
+
+        // std::cout<< " gop_ is " << gop_ << endl;
+
+        if (!in_->top(frame, std::chrono::milliseconds(500))) {
+            return 0;
+        }
+
+        if(ifinfo.frame_id + gop_ - 1 < frame.frame_id) {
+            track_->pop(ifinfo, std::chrono::milliseconds(500));
+            return 0;
+        }
+
+        in_->pop(frame, std::chrono::milliseconds(500));
+
+        frame.mat = process_result(frame.mat, ifinfo, static_cast<float>(frame.frame_id - ifinfo.frame_id)/gop_);
+
+        while(!out_->push(frame, std::chrono::milliseconds(500))) {
+            if(is_stopped()) {
+                return -1;
+            }
+        }
+
+        // std::cout<< " ======= " << endl;
+        
+
+        // while(!out_->push(frame, std::chrono::milliseconds(500))) {
+        //     if(is_stopped()) {
+        //         return -1;
+        //     }
+        // }
+        return 0;
+    }
+
+    virtual std::string name() override {
+        return std::string{"PFrameThread"};
+    }
+
+private:
+    trackq_t* in_;
+    queue_t* out_;
+    trackq_t* track_;
+    int gop_;
+};
+
+template<typename T>
+class IFrameDetectThread : public MyThread {
+public:
+    IFrameDetectThread(trackq_t* in, trackq_t* out, std::unique_ptr<T>&& model)
+        : MyThread{}
+        , in_(in)
+        , out_(out)
+        , model_(std::move(model))
+    {}
+
+    ~IFrameDetectThread() {}    
+
+    virtual int run() override {
+        TrackInfo frame;
+        if (!in_->pop(frame, std::chrono::milliseconds(500))) {
+            return 0;
+        }
+        std::cout << "iframe get: " << frame.frame_id << "," << frame.mat.size() << std::endl;
+        std::cout<< "in i frame doing detector" << std::endl;
+        if(!model_) { std::cout << "invalid model, wtf?" << std::endl; }
+        auto res = model_->run(frame.mat);
+        std::cout<< "in i frame inference done" << std::endl;
+        frame.bboxes = res.bboxes;
+        while(!out_->push(frame, std::chrono::milliseconds(500))) {
+            if(is_stopped()) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    virtual std::string name() override {
+        return std::string{"IFrameDetectThread"};
+    }
+
+private:
+    trackq_t* in_;
+    trackq_t* out_;
+    std::unique_ptr<T> model_;
+};
+
+class IFrameTrackingThread : public MyThread {
+public:
+    IFrameTrackingThread(trackq_t* in, queue_t* out, trackq_t* track)
+        : MyThread{}
+        , in_(in)
+        , out_(out)
+        , track_(track)
+	, tracker_()
+    {}
+
+    ~IFrameTrackingThread() {}
+
+    virtual int run() override {
+        TrackInfo frame;
+        if (!in_->pop(frame, std::chrono::milliseconds(500))) {
+            return 0;
+        }
+
+        {
+            auto w = frame.mat.cols;
+            auto h = frame.mat.rows;
+            std::vector<cv::Rect> dets;
+            for(const auto& bbox: frame.bboxes) {
+                dets.emplace_back(bbox.x*w, bbox.y*h, bbox.width*w, bbox.height*h);
+            }
+            tracker_.Run(dets);
+
+            auto tracks = tracker_.GetTracks();
+
+            frame.velocity.clear();
+            for (auto &trk : tracks) {
+                const auto &state = trk.second.GetState();
+                frame.velocity.emplace_back(
+                    static_cast<float>(state[4]),
+                    static_cast<float>(state[5]),
+                    static_cast<float>(state[6]),
+                    static_cast<float>(state[7])
+                );
+            }
+        }
+
+        while(!track_->push(frame, std::chrono::milliseconds(500))) {
+            if(is_stopped()) {
+                return -1;
+            }
+        }
+
+        process_result(frame.mat, frame, 0);
+
+        while(!out_->push(frame, std::chrono::milliseconds(500))) {
+            if(is_stopped()) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    virtual std::string name() override {
+        return std::string{"IFrameTrackingThread"};
+    }
+
+private:
+    trackq_t* in_;
+    queue_t* out_;
+    trackq_t* track_;
+    Tracker tracker_;
+};
+
+using namespace cv;
+
+static cv::Scalar labelColor(int label) {
+  int c[3];
+  for (int i = 1, j = 0; i <= 9; i *= 3, j++) {
+    c[j] = ((label / i) % 3) * 127;
+  }
+  return cv::Scalar(c[2], c[1], c[0]);
+}
+
+// Entrance of single channel video demo
+int main(int argc, char* argv[]) {
+    signal(SIGINT, MyThread::signal_handler);
+    auto device = argv[1];
+    auto model = argv[2];
+    auto gop = stoi(argv[3]);
+
+
+    auto channel_id = 0;
+    auto decode_queue = std::unique_ptr<queue_t>{new queue_t{5}};
+    auto decode_thread = std::unique_ptr<DecodeThread>(
+        new DecodeThread{channel_id, device, decode_queue.get()});
+
+    auto iframe_queue = std::unique_ptr<trackq_t>{new trackq_t{5}};
+    auto pframe_queue = std::unique_ptr<trackq_t>{new trackq_t{10}};
+    auto mux_thread = std::unique_ptr<MuxThread>(
+        new MuxThread{decode_queue.get(), iframe_queue.get(), pframe_queue.get(), gop}
+    );
+
+    auto idectect_to_track_queue = std::unique_ptr<trackq_t>{new trackq_t{5}};
+    auto iftopf_trackq = std::unique_ptr<trackq_t>{new trackq_t{5}};
+    auto sorting_queue =
+        std::unique_ptr<queue_t>(new queue_t(5 * 1));
+
+    auto idetect_thread = std::unique_ptr<IFrameDetectThread<YOLOv3>>(
+        new IFrameDetectThread{iframe_queue.get(), idectect_to_track_queue.get(), vitis::ai::YOLOv3::create(model)}
+    );
+
+    auto itracking_thread = std::unique_ptr<IFrameTrackingThread>(
+        new IFrameTrackingThread{idectect_to_track_queue.get(), sorting_queue.get(), iftopf_trackq.get()}
+    );
+
+    auto pframe_thread = std::unique_ptr<PFrameThread>(
+        new PFrameThread{pframe_queue.get(), sorting_queue.get(), iftopf_trackq.get(), gop}
+    );
+
+    auto gui_thread = GuiThread::instance();
+    auto gui_queue = gui_thread->getQueue();
+    auto sorting_thread = std::unique_ptr<SortingThread>(
+        new SortingThread(sorting_queue.get(), gui_queue, std::to_string(0)));
+    // start everything
+    
+    std::cout << "starting threads..." << std::endl;
+    MyThread::start_all();
+    gui_thread->wait();
+    MyThread::stop_all();
+    MyThread::wait_all();
+    LOG_IF(INFO, ENV_PARAM(DEBUG_DEMO)) << "BYEBYE";
+    return 0;
+}
+
+/*
+int old_main(int argc, char *argv[]) {
+
+    std::string model = argv[1];
+    auto Agilev4 = vitis::ai::YOLOv3::create(model);
+    int gop_num = 5;
+    int frame_ret = 0;
+    // std::string gop = argv[2];
+    // cout << gop << endl;
+
+    FeatureTensor
+
+    VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        cout << "Cannot open camera\n";
+        return 1;
+    }
+
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 800);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 600);
+
+    Mat frame;
+    //namedWindow("live", WINDOW_AUTOSIZE); // 命名一個視窗，可不寫
+
+    while (true) {
+        // 擷取影像
+        frame_ret ++;
+        bool ret = cap.read(frame); // or cap >> frame;
+        if (!ret) {
+            cout << "Can't receive frame (stream end?). Exiting ...\n";
+            break;
+        }
+        //resize
+        //cv::resize(frame, frame, cv::Size(800, 600));
+
+        if (frame_ret % gop_num == 0){
+            cout << "at i frame !! " << endl;
+            auto results = Agilev4->run(frame);
+            for (auto &box : results.bboxes){
+                float conf = box.score;
+                int label = box.label;
+                float xmin = box.x * frame.cols + 1;
+                float ymin = box.y * frame.rows + 1;
+                float xmax = xmin + box.width * frame.cols;
+                float ymax = ymin + box.height * frame.rows;
+                if(xmin < 0.) xmin = 1.;
+                if(ymin < 0.) ymin = 1.;
+                if(xmax > frame.cols) xmax = frame.cols;
+                if(ymax > frame.rows) ymax = frame.rows;
+                float confidence = box.score;
+                cout << "\tRESULT: " << label << "\t" << xmin << "\t" << ymin
+                            << "\t" << xmax << "\t" << ymax << "\t" << confidence
+                            << "\n";
+                cv::rectangle(frame, cv::Point(xmin, ymin), cv::Point(xmax, ymax),
+                    labelColor(label), 1, 1, 0);                
+            }
+            cout << "\tdoing tracking " << endl;
+        }else{
+            cout << "at p frame !! " << endl;
+            cout << "\tupdate result plus v " << endl;
+        }
+        cout << "                               " << endl;
+
+        // 顯示圖片
+        imshow("live", frame);
+        //imshow("live", gray);
+
+        // 按下 q 鍵離開迴圈
+        if (waitKey(1) == 'q') {
+            break;
+        }
+    }
+    // VideoCapture 會自動在解構子裡釋放資源
+    return 0;
+}
+*/
+
+// int main(int argc, char *argv[]){
+//   cv::Mat frame;
+//   std::string model = argv[1];
+//   auto Agilev4 = vitis::ai::YOLOv3::create(model);
+//   cv::VideoCapture cap(0);
+//   if (!cap.isOpened()) {
+//       cout << "Cannot open camera\n";
+//       return 1;
+//   }
+
+//   while (true) {
+//     // 擷取影像
+//     bool ret = cap.read(frame); // or cap >> frame;
+//     if (!ret) {
+//         cout << "Can't receive frame (stream end?). Exiting ...\n";
+//         break;
+//     }
+//     auto results = Agilev4->run(frame);
+//     for(auto &box : results.bboxes){
+//       int label = box.label;
+//       float xmin = box.x * frame.cols + 1;
+//       float ymin = box.y * frame.rows + 1;
+//       float xmax = xmin + box.width * frame.cols;
+//       float ymax = ymin + box.height * frame.rows;
+//       if(xmin < 0.) xmin = 1.;
+//       if(ymin < 0.) ymin = 1.;
+//       if(xmax > frame.cols) xmax = frame.cols;
+//       if(ymax > frame.rows) ymax = frame.rows;
+//       float confidence = box.score;
+
+//       cout << "RESULT: " << label << "\t" << xmin << "\t" << ymin << "\t"
+//             << xmax << "\t" << ymax << "\t" << confidence << "\n";
+//       if (label == 0) {
+//         cv::rectangle(frame, cv::Point(xmin, ymin), cv::Point(xmax, ymax), cv::Scalar(0, 255, 0),
+//                   1, 1, 0);
+//       } else if (label == 1) {
+//         cv::rectangle(frame, cv::Point(xmin, ymin), cv::Point(xmax, ymax), cv::Scalar(255, 0, 0),
+//                   1, 1, 0);
+//       } else if (label == 2) {
+//         cv::rectangle(frame, cv::Point(xmin, ymin), cv::Point(xmax, ymax), cv::Scalar(0, 0, 255),
+//                   1, 1, 0);
+//       } else if (label == 3) {
+//         cv::rectangle(frame, cv::Point(xmin, ymin), cv::Point(xmax, ymax),
+//                   cv::Scalar(0, 255, 255), 1, 1, 0);
+//       }
+//       // cv::rectangle(image, cv::Point(xmin, ymin), cv::Point(xmax, ymax),
+//       //               getColor(label), 1, 1, 0);
+//       cv::imshow("demo", frame);
+//       if (cv::waitKey(1) == 'q') {
+//             break;
+//         }
+//       }
+//     }
+//    return 0;
+//   }
+
+
+//     auto yolo =
+//  vitis::ai::YOLOv3::create("yolov3_adas_pruned_0_9", true);
+//     Mat img = cv::imread("sample_yolov3.jpg");
+
+//     auto results = yolo->run(img);
+
+//     for(auto &box : results.bboxes){
+//       int label = box.label;
+//       float xmin = box.x * img.cols + 1;
+//       float ymin = box.y * img.rows + 1;
+//       float xmax = xmin + box.width * img.cols;
+//       float ymax = ymin + box.height * img.rows;
+//       if(xmin < 0.) xmin = 1.;
+//       if(ymin < 0.) ymin = 1.;
+//       if(xmax > img.cols) xmax = img.cols;
+//       if(ymax > img.rows) ymax = img.rows;
+//       float confidence = box.score;
+
+//       cout << "RESULT: " << label << "\t" << xmin << "\t" << ymin << "\t"
+//            << xmax << "\t" << ymax << "\t" << confidence << "\n";
+//       if (label == 0) {
+//         rectangle(img, Point(xmin, ymin), Point(xmax, ymax), Scalar(0, 255, 0),
+//                   1, 1, 0);
+//       } else if (label == 1) {
+//         rectangle(img, Point(xmin, ymin), Point(xmax, ymax), Scalar(255, 0, 0),
+//                   1, 1, 0);
+//       } else if (label == 2) {
+//         rectangle(img, Point(xmin, ymin), Point(xmax, ymax), Scalar(0, 0, 255),
+//                   1, 1, 0);
+//       } else if (label == 3) {
+//         rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
+//                   Scalar(0, 255, 255), 1, 1, 0);
+//       }
+
+//     }
+//     imwrite("sample_yolov3_result.jpg", img);
