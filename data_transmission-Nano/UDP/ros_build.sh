@@ -1,0 +1,1 @@
+g++ -I/opt/ros/melodic/include/ -o ros_publish ros_publish.cpp -L/opt/ros/melodic/lib/ -Wl,-rpath,/opt/ros/melodic/lib -lroscpp -lrosconsole -lrostime -lroscpp_serialization -lboost_system -lboost_thread -pthread -lactionlib
