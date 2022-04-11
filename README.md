@@ -9,8 +9,11 @@ In this part, we deploy the object detection on the FPGA platform and use the HT
 >1.install image
 >
 [etcher](https://www.balena.io/etcher/)
+
 [image download](https://drive.google.com/file/d/147AWFSlIql7TuC5glqqHnXguY3aj0za1/view?usp=sharing)
+
 [nano zip](https://drive.google.com/file/d/108nCZVAG70VNibhEjQqGPz2Bz0BQnwNI/view?usp=sharing)
+
 >2.IP set
 >
 modify network_set.sh
